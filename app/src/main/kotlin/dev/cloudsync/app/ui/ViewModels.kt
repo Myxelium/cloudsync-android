@@ -45,6 +45,7 @@ import dev.cloudsync.nextcloud.LoginChallenge
 import dev.cloudsync.nextcloud.LoginPoll
 import dev.cloudsync.sync.SyncSchedule
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -53,6 +54,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import javax.inject.Inject
@@ -120,8 +122,10 @@ class FilesViewModel @Inject constructor(
             _state.value = try {
                 val entries = sort(browser.list(account, path), _state.value.sort)
                 _state.value.copy(loading = false, entries = entries, path = path)
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
-                _state.value.copy(loading = false, error = error.message ?: "Could not open this folder.")
+                _state.value.copy(loading = false, error = error.message?.takeIf { it.isNotBlank() } ?: "Could not open this folder.")
             }
         }
     }
@@ -137,8 +141,10 @@ class FilesViewModel @Inject constructor(
             _state.value = try {
                 val entries = if (term.isBlank()) browser.list(account, _state.value.path) else browser.search(account, term)
                 _state.value.copy(loading = false, entries = sort(entries, _state.value.sort))
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
-                _state.value.copy(loading = false, error = error.message ?: "Search failed.")
+                _state.value.copy(loading = false, error = error.message?.takeIf { it.isNotBlank() } ?: "Search failed.")
             }
         }
     }
@@ -172,7 +178,9 @@ class FilesViewModel @Inject constructor(
         val account = accountId ?: return
         viewModelScope.launch {
             try {
-                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: error("Could not read the selected file.")
+                val bytes = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                } ?: error("Could not read the selected file.")
                 browser.upload(account, _state.value.path, displayName, bytes)
                 open(_state.value.path)
             } catch (error: Exception) {

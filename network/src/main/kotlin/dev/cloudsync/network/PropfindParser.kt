@@ -17,10 +17,9 @@ object PropfindParser {
         factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
         factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
         val document = factory.newDocumentBuilder().parse(InputSource(StringReader(xml)))
-        val responses = document.getElementsByTagNameNS("*", "response")
+        val root = document.documentElement ?: return emptyList()
         val nodes = mutableListOf<RemoteNode>()
-        for (index in 0 until responses.length) {
-            val response = responses.item(index) as? Element ?: continue
+        for (response in elements(root, "response")) {
             val href = text(response, "href") ?: continue
             val path = hrefToPath(href, userRootHref) ?: continue
             val collection = elements(response, "collection").isNotEmpty() ||
@@ -44,26 +43,35 @@ object PropfindParser {
     }
 
     fun hrefToPath(href: String, userRootHref: String): String? {
-        val decoded = java.net.URLDecoder.decode(href.substringBefore('?'), Charsets.UTF_8)
-        val root = java.net.URLDecoder.decode(userRootHref.substringBefore('?'), Charsets.UTF_8).trimEnd('/')
-        val normalized = if (decoded.startsWith("http")) {
-            val marker = "/remote.php/dav/files/"
-            val index = decoded.indexOf(marker)
-            if (index < 0) return null
-            decoded.substring(index)
-        } else {
-            decoded
-        }
-        val rootPath = if (root.startsWith("http")) {
-            val marker = "/remote.php/dav/files/"
-            root.substring(root.indexOf(marker))
-        } else {
-            root
-        }
-        if (normalized.trimEnd('/') == rootPath) return "/"
-        if (!normalized.startsWith(rootPath)) return null
-        val relative = normalized.removePrefix(rootPath).trim('/')
+        val node = davPath(href) ?: return null
+        val root = davPath(userRootHref) ?: return null
+        val nodeTrim = node.trimEnd('/')
+        val rootTrim = root.trimEnd('/')
+        if (nodeTrim == rootTrim) return "/"
+        if (!nodeTrim.startsWith("$rootTrim/")) return null
+        val relative = nodeTrim.removePrefix(rootTrim).trim('/')
         return if (relative.isEmpty()) "/" else "/$relative"
+    }
+
+    fun decodeHref(value: String): String = try {
+        java.net.URLDecoder.decode(value.replace("+", "%2B"), Charsets.UTF_8)
+    } catch (_: IllegalArgumentException) {
+        value
+    }
+
+    fun davPath(href: String): String? {
+        val raw = decodeHref(href.substringBefore('?')).trim()
+        if (raw.isEmpty()) return null
+        val path = if (raw.startsWith("http://") || raw.startsWith("https://")) {
+            val scheme = raw.indexOf("://")
+            val slash = raw.indexOf('/', startIndex = scheme + 3)
+            if (slash < 0) "/" else raw.substring(slash)
+        } else if (raw.startsWith("/")) {
+            raw
+        } else {
+            "/$raw"
+        }
+        return path
     }
 
     private fun parseHttpDate(value: String): Long? = try {
@@ -72,14 +80,43 @@ object PropfindParser {
         null
     }
 
-    private fun text(parent: Element, localName: String): String? = elements(parent, localName).firstOrNull()?.textContent?.trim()?.ifEmpty { null }
+    private fun text(parent: Element, localName: String): String? = elements(parent, localName).firstNotNullOfOrNull { element ->
+        if (inFailedPropstat(element)) return@firstNotNullOfOrNull null
+        element.textContent?.trim()?.ifEmpty { null }
+    }
 
-    private fun elements(parent: Element, localName: String): List<Element> {
-        val matches = parent.getElementsByTagNameNS("*", localName)
-        return buildList {
-            for (index in 0 until matches.length) {
-                (matches.item(index) as? Element)?.let(::add)
+    private fun inFailedPropstat(element: Element): Boolean {
+        var current = element.parentNode
+        while (current is Element) {
+            if (localNameOf(current) == "propstat") {
+                val status = elements(current, "status").firstOrNull()?.textContent.orEmpty()
+                if (status.isBlank()) return false
+                return !status.contains(" 2")
+            }
+            current = current.parentNode
+        }
+        return false
+    }
+
+    private fun elements(parent: Element, localName: String): List<Element> = buildList {
+        val pending = ArrayDeque<Element>()
+        val children = parent.childNodes
+        for (index in 0 until children.length) {
+            (children.item(index) as? Element)?.let(pending::add)
+        }
+        while (pending.isNotEmpty()) {
+            val current = pending.removeFirst()
+            if (localNameOf(current) == localName) add(current)
+            val nested = current.childNodes
+            for (index in 0 until nested.length) {
+                (nested.item(index) as? Element)?.let(pending::add)
             }
         }
+    }
+
+    private fun localNameOf(element: Element): String {
+        val local = element.localName
+        if (!local.isNullOrEmpty()) return local
+        return element.tagName.substringAfter(':')
     }
 }
