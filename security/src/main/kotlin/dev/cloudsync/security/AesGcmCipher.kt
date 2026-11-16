@@ -1,6 +1,5 @@
 package dev.cloudsync.security
 
-import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
@@ -15,10 +14,11 @@ object AesGcmCipher {
     private const val TAG_BITS = 128
 
     fun encrypt(key: SecretKey, plaintext: ByteArray): ByteArray {
-        val iv = ByteArray(IV_BYTES)
-        SecureRandom().nextBytes(iv)
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(TAG_BITS, iv))
+        // Keystore keys with randomized encryption reject a caller-supplied IV.
+        cipher.init(Cipher.ENCRYPT_MODE, key)
+        val iv = cipher.iv
+        require(iv != null && iv.size == IV_BYTES) { "AES-GCM did not produce a 12-byte IV." }
         val encrypted = cipher.doFinal(plaintext)
         return iv + encrypted
     }

@@ -16,6 +16,7 @@ import dev.cloudsync.core.model.SyncDirection
 import dev.cloudsync.core.model.SyncFolder
 import dev.cloudsync.core.model.TrackedFile
 import dev.cloudsync.core.model.TrackedState
+import dev.cloudsync.core.model.TransferStatus
 import dev.cloudsync.core.model.VersionOrigin
 import dev.cloudsync.core.time.Clock
 import dev.cloudsync.core.time.IdGenerator
@@ -201,6 +202,38 @@ class SyncEngineTest {
     }
 
     @Test
+    fun droppedUploadResumesAndFinishes() = runBlocking<Unit> {
+        val harness = harness()
+        harness.local.put("notes.txt", "local-change")
+        harness.remote.files["/Notes/notes.txt"] = FakeRemoteFiles.Stored("original".encodeToByteArray(), "etag", "id")
+        harness.seedAndTrack("notes.txt", "original", "etag")
+        harness.remote.failNextUpload = true
+
+        val failed = harness.engine.synchronize(harness.request())
+        assertEquals(FolderStatus.ERROR, failed.status)
+        val queued = harness.state.transferList.single()
+        assertEquals(TransferStatus.QUEUED, queued.status)
+        assertEquals("upload-resume", queued.uploadId)
+        assertEquals(3, queued.nextChunk)
+        assertEquals(1, harness.remote.calls.count { it.startsWith("UPLOAD") })
+        assertEquals("original", harness.remote.files["/Notes/notes.txt"]!!.bytes.decodeToString())
+
+        val waiting = harness.engine.synchronize(harness.request())
+        assertEquals(FolderStatus.WAITING_NETWORK, waiting.status)
+        assertEquals(1, harness.remote.calls.count { it.startsWith("UPLOAD") })
+        assertEquals(TransferStatus.QUEUED, harness.state.transferList.single().status)
+
+        harness.now = queued.nextRetryAt!!
+        val finished = harness.engine.synchronize(harness.request())
+        assertEquals(FolderStatus.IDLE, finished.status)
+        assertEquals("local-change", harness.remote.files["/Notes/notes.txt"]!!.bytes.decodeToString())
+        assertEquals("upload-resume", harness.remote.resumedUploadId)
+        assertEquals(3, harness.remote.resumedChunk)
+        assertEquals(TransferStatus.COMPLETED, harness.state.transferList.single { it.status == TransferStatus.COMPLETED }.status)
+        assertEquals(2, harness.remote.calls.count { it.startsWith("UPLOAD") })
+    }
+
+    @Test
     fun mobileCanDownloadWhileUploadsStayOnWifi() = runBlocking<Unit> {
         val harness = harness(allowUploadOnMobile = false)
         harness.local.put("dirty.txt", "local-change")
@@ -257,6 +290,8 @@ class SyncEngineTest {
         val networkMode: NetworkMode,
         val allowUploadOnMobile: Boolean,
     ) {
+        var now: Long = 1_000
+
         fun wired(): Harness {
             var next = 100
             engine = SyncEngine(
@@ -265,7 +300,7 @@ class SyncEngineTest {
                 versions = versions,
                 state = state,
                 ids = IdGenerator { "id-${next++}" },
-                clock = Clock { 1_000 },
+                clock = Clock { now },
             )
             return this
         }

@@ -17,6 +17,7 @@ import dev.cloudsync.core.remote.DownloadResult
 import dev.cloudsync.core.remote.RemoteFiles
 import dev.cloudsync.core.remote.RemoteNode
 import dev.cloudsync.core.remote.RemoteVersion
+import dev.cloudsync.core.remote.UploadProgress
 import dev.cloudsync.core.remote.UploadResult
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -83,9 +84,10 @@ class WebDavClient(
         ifMatch: String?,
         uploadId: String?,
         resumeFromChunk: Int,
+        onProgress: (suspend (UploadProgress) -> Unit)?,
     ): UploadResult {
         if (size > chunkSize) {
-            return uploadChunked(account, path, source, size, ifMatch, uploadId, resumeFromChunk)
+            return uploadChunked(account, path, source, size, ifMatch, uploadId, resumeFromChunk, onProgress)
         }
         val bytes = source.open().use { it.readBytes() }
         val builder = base(account, filesUrl(account, path))
@@ -174,11 +176,19 @@ class WebDavClient(
         ifMatch: String?,
         existingUploadId: String?,
         resumeFromChunk: Int,
+        onProgress: (suspend (UploadProgress) -> Unit)?,
     ): UploadResult {
         val uploadId = existingUploadId ?: "cloudsync-${UUID.randomUUID()}"
         val destination = filesUrl(account, path)
         val collection = uploadsUrl(account, uploadId)
-        if (resumeFromChunk <= 1) {
+        val startChunk = resumeFromChunk.coerceAtLeast(1)
+        var bytesSent = 0L
+        suspend fun report(nextChunk: Int) {
+            onProgress?.invoke(UploadProgress(uploadId, nextChunk, bytesSent.coerceAtMost(size)))
+        }
+        // Persist the id before any network call so a dropped connection can resume this collection.
+        report(startChunk)
+        if (startChunk <= 1) {
             val create = base(account, collection)
                 .method("MKCOL", ByteArray(0).toRequestBody(null))
                 .header("Destination", destination)
@@ -187,13 +197,14 @@ class WebDavClient(
                 if (response.code != 405) ensureSuccess(response)
             }
         }
+        var nextChunk = startChunk
         source.open().use { input ->
             val buffer = ByteArray(chunkSize)
             var chunk = 1
             while (true) {
                 val read = readChunk(input, buffer)
                 if (read <= 0) break
-                if (chunk >= resumeFromChunk) {
+                if (chunk >= startChunk) {
                     val name = chunk.toString().padStart(5, '0')
                     val put = base(account, "$collection/$name")
                         .put(buffer.copyOf(read).toRequestBody(OCTET))
@@ -201,10 +212,18 @@ class WebDavClient(
                         .header("OC-Total-Length", size.toString())
                         .build()
                     execute(put).use { ensureSuccess(it) }
+                    bytesSent += read
+                    nextChunk = chunk + 1
+                    report(nextChunk)
+                } else {
+                    bytesSent += read
                 }
                 chunk++
             }
+            nextChunk = chunk
         }
+        // Chunks are on the server. A retry from here only repeats the assembly MOVE.
+        report(nextChunk)
         val assemble = base(account, "$collection/.file")
             .method("MOVE", ByteArray(0).toRequestBody(null))
             .header("Destination", destination)

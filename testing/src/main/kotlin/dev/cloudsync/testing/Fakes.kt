@@ -1,5 +1,6 @@
 package dev.cloudsync.testing
 
+import dev.cloudsync.core.error.NetworkException
 import dev.cloudsync.core.error.RemoteChangedException
 import dev.cloudsync.core.etag.Etags
 import dev.cloudsync.core.hash.ContentHash
@@ -15,6 +16,7 @@ import dev.cloudsync.core.remote.LocalNode
 import dev.cloudsync.core.remote.RemoteFiles
 import dev.cloudsync.core.remote.RemoteNode
 import dev.cloudsync.core.remote.RemoteVersion
+import dev.cloudsync.core.remote.UploadProgress
 import dev.cloudsync.core.remote.UploadResult
 import dev.cloudsync.core.sync.SyncStateStore
 
@@ -54,6 +56,9 @@ class FakeRemoteFiles : RemoteFiles {
     val calls = mutableListOf<String>()
     var etagCounter = 1
     var failNextMatchedUpload = false
+    var failNextUpload = false
+    var resumedUploadId: String? = null
+    var resumedChunk: Int = -1
 
     data class Stored(var bytes: ByteArray, var etag: String, var fileId: String, var directory: Boolean = false)
 
@@ -84,8 +89,18 @@ class FakeRemoteFiles : RemoteFiles {
         ifMatch: String?,
         uploadId: String?,
         resumeFromChunk: Int,
+        onProgress: (suspend (UploadProgress) -> Unit)?,
     ): UploadResult {
         calls += "UPLOAD $path"
+        resumedUploadId = uploadId
+        resumedChunk = resumeFromChunk
+        val id = uploadId ?: "upload-resume"
+        val nextChunk = if (resumeFromChunk <= 1) 3 else resumeFromChunk
+        onProgress?.invoke(UploadProgress(id, nextChunk, 8))
+        if (failNextUpload) {
+            failNextUpload = false
+            throw NetworkException("The connection dropped before the upload was assembled.")
+        }
         val existing = files[path]
         if (ifMatch != null && (existing == null || !Etags.same(ifMatch, existing.etag))) {
             throw RemoteChangedException("remote changed")
