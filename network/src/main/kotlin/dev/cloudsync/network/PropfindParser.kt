@@ -9,13 +9,14 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import javax.xml.XMLConstants
 import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.parsers.ParserConfigurationException
 
 object PropfindParser {
     fun parse(xml: String, userRootHref: String): List<RemoteNode> {
         val factory = DocumentBuilderFactory.newInstance()
         factory.isNamespaceAware = true
-        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
-        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+        factory.isExpandEntityReferences = false
+        enableXmlLimits { name, value -> factory.setFeature(name, value) }
         val document = factory.newDocumentBuilder().parse(InputSource(StringReader(xml)))
         val root = document.documentElement ?: return emptyList()
         val nodes = mutableListOf<RemoteNode>()
@@ -51,6 +52,28 @@ object PropfindParser {
         if (!nodeTrim.startsWith("$rootTrim/")) return null
         val relative = nodeTrim.removePrefix(rootTrim).trim('/')
         return if (relative.isEmpty()) "/" else "/$relative"
+    }
+
+    /**
+     * Android's XML parser throws ParserConfigurationException for
+     * http://javax.xml.XMLConstants/feature/secure-processing and uses that URI as the message.
+     * Other limits are still requested. A parser that supports them keeps them.
+     */
+    fun enableXmlLimits(setFeature: (String, Boolean) -> Unit) {
+        val limits = listOf(
+            XMLConstants.FEATURE_SECURE_PROCESSING to true,
+            "http://apache.org/xml/features/disallow-doctype-decl" to true,
+            "http://xml.org/sax/features/external-general-entities" to false,
+            "http://xml.org/sax/features/external-parameter-entities" to false,
+            "http://apache.org/xml/features/nonvalidating/load-external-dtd" to false,
+        )
+        for ((name, value) in limits) {
+            try {
+                setFeature(name, value)
+            } catch (_: ParserConfigurationException) {
+            } catch (_: IllegalArgumentException) {
+            }
+        }
     }
 
     fun decodeHref(value: String): String = try {
