@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertTrue
 
 class LoginFlowTest {
     @Test
@@ -33,6 +34,49 @@ class LoginFlowTest {
             assertEquals("alice", success.loginName)
             assertEquals("app-secret", success.appPassword)
             assertEquals("POST", server.takeRequest().method)
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun pollRepostsTheTokenWhenTheEndpointRedirects() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val base = server.url("/").toString().trimEnd('/')
+            server.enqueue(MockResponse.Builder().code(302).addHeader("Location", "$base/index.php/login/v2/poll").build())
+            server.enqueue(
+                MockResponse.Builder().code(200).body(
+                    """{"server":"$base","loginName":"alice","appPassword":"app-secret"}""",
+                ).build(),
+            )
+            val client = LoginFlowClient(OkHttpClient(), requireHttps = false)
+            val success = client.poll("$base/login/v2/poll", "tok") as LoginPoll.Success
+            assertEquals("alice", success.loginName)
+            val redirected = server.takeRequest()
+            val completed = server.takeRequest()
+            assertEquals("POST", redirected.method)
+            assertEquals("POST", completed.method)
+            assertEquals("/index.php/login/v2/poll", completed.url.encodedPath)
+            assertTrue(completed.body!!.utf8().contains("token=tok"))
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun pollKeepsWaitingThroughATwoFactorRedirectAndRateLimit() {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val base = server.url("/").toString().trimEnd('/')
+            server.enqueue(MockResponse.Builder().code(303).addHeader("Location", "$base/login/selectchallenge").build())
+            server.enqueue(MockResponse.Builder().code(429).build())
+            val client = LoginFlowClient(OkHttpClient(), requireHttps = false)
+            assertIs<LoginPoll.Pending>(client.poll("$base/login/v2/poll", "tok"))
+            assertEquals(1, server.requestCount)
+            assertIs<LoginPoll.Throttled>(client.poll("$base/login/v2/poll", "tok"))
         } finally {
             server.close()
         }

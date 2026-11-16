@@ -18,6 +18,7 @@ import dev.cloudsync.app.data.mimeFor
 import dev.cloudsync.app.sync.CloudSyncTransferService
 import dev.cloudsync.app.sync.NetworkMonitor
 import dev.cloudsync.app.sync.SyncCoordinator
+import dev.cloudsync.core.error.NetworkException
 import dev.cloudsync.core.model.Account
 import dev.cloudsync.core.model.Conflict
 import dev.cloudsync.core.model.DeletionPolicy
@@ -40,14 +41,19 @@ import dev.cloudsync.database.toModel
 import dev.cloudsync.merge.MergeCoordinator
 import dev.cloudsync.merge.MergeResult
 import dev.cloudsync.merge.TextDiff
+import dev.cloudsync.nextcloud.LoginChallenge
 import dev.cloudsync.nextcloud.LoginPoll
 import dev.cloudsync.sync.SyncSchedule
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import javax.inject.Inject
 
@@ -414,32 +420,102 @@ class SettingsViewModel @Inject constructor(
 data class LoginState(val busy: Boolean = false, val message: String? = null, val done: Boolean = false, val url: String? = null)
 
 @HiltViewModel
-class LoginViewModel @Inject constructor(private val accounts: AccountRepository) : ViewModel() {
+class LoginViewModel @Inject constructor(
+    private val accounts: AccountRepository,
+    private val savedState: SavedStateHandle,
+) : ViewModel() {
     private val _state = MutableStateFlow(LoginState())
     val state = _state.asStateFlow()
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+    private var session: Job? = null
+
+    init {
+        if (savedState.get<Boolean>(LOGIN_DONE) == true) {
+            _state.value = LoginState(done = true, message = "Connected.")
+        } else {
+            val endpoint = savedState.get<String>(LOGIN_ENDPOINT)
+            val token = savedState.get<String>(LOGIN_TOKEN)
+            if (!endpoint.isNullOrBlank() && !token.isNullOrBlank()) {
+                val challenge = LoginChallenge(token, endpoint, savedState.get<String>(LOGIN_URL).orEmpty())
+                session = viewModelScope.launch { awaitCredentials(challenge, openBrowser = false) }
+            }
+        }
+    }
+
+    fun onResume() {
+        wake.trySend(Unit)
+    }
 
     fun start(server: String) {
-        viewModelScope.launch {
-            _state.value = LoginState(busy = true)
+        session?.cancel()
+        savedState[LOGIN_DONE] = false
+        session = viewModelScope.launch {
+            _state.value = LoginState(busy = true, message = "Contacting the Nextcloud server…")
             try {
                 val challenge = accounts.beginLogin(server)
-                _state.value = LoginState(busy = true, url = challenge.loginUrl, message = "Approve CloudSync in the browser window. This screen waits until Nextcloud returns an app password.")
-                repeat(150) {
-                    kotlinx.coroutines.delay(2_000)
-                    when (val poll = accounts.poll(challenge)) {
-                        LoginPoll.Pending -> Unit
-                        is LoginPoll.Success -> {
-                            accounts.completeLogin(poll)
-                            _state.value = LoginState(done = true, message = "Connected.")
-                            return@launch
-                        }
-                    }
-                }
-                _state.value = LoginState(message = "The sign-in window expired before it was approved.")
+                savedState[LOGIN_ENDPOINT] = challenge.endpoint
+                savedState[LOGIN_TOKEN] = challenge.token
+                savedState[LOGIN_URL] = challenge.loginUrl
+                awaitCredentials(challenge, openBrowser = true)
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 _state.value = LoginState(message = error.message ?: "Could not start sign-in.")
             }
         }
+    }
+
+    private suspend fun awaitCredentials(challenge: LoginChallenge, openBrowser: Boolean) {
+        _state.value = LoginState(
+            busy = true,
+            url = challenge.loginUrl.takeIf { openBrowser },
+            message = "Approve CloudSync in the browser. Sign-in finishes here after Nextcloud grants access, including when you come back.",
+        )
+        val deadline = System.currentTimeMillis() + LOGIN_WINDOW_MILLIS
+        while (System.currentTimeMillis() < deadline) {
+            val outcome = try {
+                accounts.poll(challenge)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: NetworkException) {
+                LoginPoll.Pending
+            } catch (error: Exception) {
+                forgetLogin()
+                _state.value = LoginState(message = error.message ?: "Could not finish sign-in.")
+                return
+            }
+            when (outcome) {
+                LoginPoll.Pending -> waitForPoll(2_000)
+                LoginPoll.Throttled -> waitForPoll(8_000)
+                is LoginPoll.Success -> {
+                    try {
+                        accounts.completeLogin(outcome)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        forgetLogin()
+                        _state.value = LoginState(message = error.message ?: "Nextcloud approved the login, but the app could not store it.")
+                        return
+                    }
+                    forgetLogin()
+                    savedState[LOGIN_DONE] = true
+                    _state.value = LoginState(done = true, message = "Connected.")
+                    return
+                }
+            }
+        }
+        forgetLogin()
+        _state.value = LoginState(message = "The sign-in window expired before Nextcloud returned an app password.")
+    }
+
+    private suspend fun waitForPoll(millis: Long) {
+        withTimeoutOrNull(millis) { wake.receive() }
+    }
+
+    private fun forgetLogin() {
+        savedState[LOGIN_ENDPOINT] = null
+        savedState[LOGIN_TOKEN] = null
+        savedState[LOGIN_URL] = null
     }
 
     fun appPassword(server: String, username: String, secret: String) {
@@ -456,6 +532,14 @@ class LoginViewModel @Inject constructor(private val accounts: AccountRepository
 
     fun consumeUrl() {
         _state.value = _state.value.copy(url = null)
+    }
+
+    private companion object {
+        const val LOGIN_ENDPOINT = "loginEndpoint"
+        const val LOGIN_TOKEN = "loginToken"
+        const val LOGIN_URL = "loginUrl"
+        const val LOGIN_DONE = "loginDone"
+        const val LOGIN_WINDOW_MILLIS = 20 * 60 * 1000L
     }
 }
 

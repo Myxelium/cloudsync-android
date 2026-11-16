@@ -31,6 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,6 +40,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.cloudsync.app.data.SettingKeys
 import dev.cloudsync.core.model.DeletionPolicy
@@ -405,9 +409,17 @@ fun SettingsScreen(onAddAccount: () -> Unit, viewModel: SettingsViewModel = hilt
 @Composable
 fun LoginScreen(onOpenUrl: (String) -> Unit, onDone: () -> Unit, viewModel: LoginViewModel = hiltViewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
     var server by remember { mutableStateOf("https://") }
     var username by remember { mutableStateOf("") }
     var secret by remember { mutableStateOf("") }
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.onResume()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     LaunchedEffect(state.url) {
         val url = state.url ?: return@LaunchedEffect
         onOpenUrl(url)
@@ -423,6 +435,7 @@ fun LoginScreen(onOpenUrl: (String) -> Unit, onDone: () -> Unit, viewModel: Logi
                 "HTTPS only. Certificate checks stay on. The account password you might type is exchanged for an app password when the server allows it, and only that app password is stored.",
             )
             OutlinedTextField(server, { server = it }, label = { Text("Server") }, modifier = Modifier.fillMaxWidth())
+            if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             Button(onClick = { viewModel.start(server) }, enabled = !state.busy) { Text("Sign in with browser") }
             Text("Or use an existing app password")
             OutlinedTextField(username, { username = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())
