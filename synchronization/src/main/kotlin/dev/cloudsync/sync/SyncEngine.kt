@@ -1,6 +1,7 @@
 package dev.cloudsync.sync
 
 import dev.cloudsync.core.error.RemoteChangedException
+import dev.cloudsync.core.error.isRetryable
 import dev.cloudsync.core.etag.Etags
 import dev.cloudsync.core.hash.ContentHash
 import dev.cloudsync.core.log.DiagnosticLog
@@ -28,6 +29,7 @@ import dev.cloudsync.core.path.SyncPaths
 import dev.cloudsync.core.remote.ContentSource
 import dev.cloudsync.core.remote.LocalFiles
 import dev.cloudsync.core.remote.RemoteFiles
+import dev.cloudsync.core.retry.RetryPolicy
 import dev.cloudsync.core.sync.SyncStateStore
 import dev.cloudsync.core.time.Clock
 import dev.cloudsync.core.time.IdGenerator
@@ -35,6 +37,7 @@ import dev.cloudsync.merge.MergeCoordinator
 import dev.cloudsync.versioning.VersionRecorder
 import dev.cloudsync.versioning.VersionRetention
 import dev.cloudsync.versioning.VersionStore
+import kotlinx.coroutines.CancellationException
 
 data class SyncRequest(
     val folder: SyncFolder,
@@ -94,6 +97,8 @@ class SyncEngine(
         var conflicts = 0
         val errors = mutableListOf<String>()
         var waiting: String? = null
+        val deferred = mutableSetOf<String>()
+        val finishedPaths = mutableSetOf<String>()
         for (action in actions) {
             if (request.isCancelled()) {
                 waiting = "Cancelled."
@@ -101,13 +106,41 @@ class SyncEngine(
             }
             try {
                 when (action) {
-                    is PlannedAction.Upload -> if (gate(folder, request.network, TransferDirection.UPLOAD, action.relativePath)?.also { waiting = it } == null) {
-                        upload(request, tracked, action)
-                        uploaded++
+                    is PlannedAction.Upload -> {
+                        val blocked = gate(folder, request.network, TransferDirection.UPLOAD, action.relativePath)
+                        if (blocked != null) {
+                            waiting = blocked
+                            deferred += action.relativePath
+                        } else {
+                            when (val step = upload(request, tracked, action)) {
+                                StepResult.Completed -> {
+                                    uploaded++
+                                    finishedPaths += action.relativePath
+                                }
+                                is StepResult.Waiting -> {
+                                    waiting = step.reason
+                                    deferred += action.relativePath
+                                }
+                            }
+                        }
                     }
-                    is PlannedAction.Download -> if (gate(folder, request.network, TransferDirection.DOWNLOAD, action.relativePath)?.also { waiting = it } == null) {
-                        download(request, tracked, action)
-                        downloaded++
+                    is PlannedAction.Download -> {
+                        val blocked = gate(folder, request.network, TransferDirection.DOWNLOAD, action.relativePath)
+                        if (blocked != null) {
+                            waiting = blocked
+                            deferred += action.relativePath
+                        } else {
+                            when (val step = download(request, tracked, action)) {
+                                StepResult.Completed -> {
+                                    downloaded++
+                                    finishedPaths += action.relativePath
+                                }
+                                is StepResult.Waiting -> {
+                                    waiting = step.reason
+                                    deferred += action.relativePath
+                                }
+                            }
+                        }
                     }
                     is PlannedAction.Merge -> if (gate(folder, request.network, TransferDirection.UPLOAD, action.relativePath)?.also { waiting = it } == null &&
                         gate(folder, request.network, TransferDirection.DOWNLOAD, action.relativePath)?.also { waiting = it } == null
@@ -135,15 +168,25 @@ class SyncEngine(
                         remote.createDirectory(request.endpoint, fullRemote(folder, action.relativePath))
                     }
                     is PlannedAction.EnsureLocalDir -> local.ensureDirectory(folder.localRoot, action.relativePath)
-                    is PlannedAction.Remember -> remember(request, tracked, action)
+                    is PlannedAction.Remember -> {
+                        remember(request, tracked, action)
+                        if (action.state == TrackedState.IN_SYNC) finishedPaths += action.relativePath
+                    }
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 val message = error.message ?: error.javaClass.simpleName
                 errors += "${action.relativePath}: $message"
                 log.error("sync", message, folder.accountId, folder.id)
-                remember(request, tracked, PlannedAction.Remember(action.relativePath, TrackedState.ERROR, message))
+                // A retryable failure keeps the previous base. Recording an error row for a
+                // brand-new file would make the next plan treat the server copy as deleted.
+                if (!isRetryable(error)) {
+                    remember(request, tracked, PlannedAction.Remember(action.relativePath, TrackedState.ERROR, message))
+                }
             }
         }
+        settleTransfers(request, finishedPaths, deferred)
         prune(request, tracked)
         val status = when {
             errors.isNotEmpty() -> FolderStatus.ERROR
@@ -245,6 +288,12 @@ class SyncEngine(
             finishTransfer(transfer, TransferStatus.FAILED, error.message)
             recordConflict(request, tracked, relative, ConflictKind.CONTENT, "The server copy changed during restore. The restored bytes stay on this device.", existing?.baseVersionId, restored.id, null)
             report(request.folder.id, FolderStatus.CONFLICTS, 0, 0, 1, null, listOf("The server copy changed. Nothing on the server was overwritten."))
+        } catch (error: CancellationException) {
+            finishTransfer(stored(transfer), TransferStatus.QUEUED, error.message)
+            throw error
+        } catch (error: Exception) {
+            finishTransfer(stored(transfer), TransferStatus.FAILED, error.message)
+            report(request.folder.id, FolderStatus.ERROR, 0, 0, 0, null, listOf(error.message ?: "The restored file was not uploaded."))
         }
     }
 
@@ -253,7 +302,20 @@ class SyncEngine(
             .filter { it.state == MergeSessionState.READY_TO_UPLOAD || it.state == MergeSessionState.UPLOADING }
             .forEach { session ->
                 val bytes = session.resultVersionId?.let { versions.content(it) } ?: return@forEach
-                uploadMerged(request, session, bytes)
+                try {
+                    uploadMerged(request, session, bytes)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    log.error("merge", error.message ?: "The merge upload stopped before it finished.", request.folder.accountId, request.folder.id)
+                    state.saveMerge(
+                        session.copy(
+                            state = MergeSessionState.READY_TO_UPLOAD,
+                            updatedAt = clock.nowMillis(),
+                            error = error.message,
+                        ),
+                    )
+                }
             }
     }
 
@@ -316,59 +378,96 @@ class SyncEngine(
         }
     }
 
-    private suspend fun upload(request: SyncRequest, tracked: MutableList<TrackedFile>, action: PlannedAction.Upload) {
+    private suspend fun upload(request: SyncRequest, tracked: MutableList<TrackedFile>, action: PlannedAction.Upload): StepResult {
         val bytes = local.read(request.folder.localRoot, action.relativePath)
         val hash = ContentHash.sha256(bytes)
         val existing = find(tracked, action.relativePath)
-        if (existing?.baseHash == hash && Etags.same(existing.baseEtag, existing.remoteEtag)) return
-        val transfer = beginTransfer(request, action.relativePath, TransferDirection.UPLOAD, bytes.size.toLong())
-        try {
-            val result = remote.upload(
-                request.endpoint,
-                fullRemote(request.folder, action.relativePath),
-                ContentSource { bytes.inputStream() },
-                bytes.size.toLong(),
-                "application/octet-stream",
-                action.ifMatch,
-            )
-            val version = recorder.snapshot(key(request, action.relativePath), VersionOrigin.UPLOAD, bytes, remoteEtag = result.etag)
-            saveTracked(
-                tracked,
-                existing,
-                request,
-                action.relativePath,
-                hash,
-                result.etag,
-                version.id,
-                TrackedState.IN_SYNC,
-                bytes.size.toLong(),
-            )
-            finishTransfer(transfer, TransferStatus.COMPLETED, result.etag)
-        } catch (error: RemoteChangedException) {
-            finishTransfer(transfer, TransferStatus.FAILED, error.message)
-            recordConflict(request, tracked, action.relativePath, ConflictKind.CONTENT, "The server copy changed during the upload.", null, null, null)
+        if (existing?.baseHash == hash && Etags.same(existing.baseEtag, existing.remoteEtag)) {
+            finishOpen(request, action.relativePath, TransferDirection.UPLOAD, TransferStatus.COMPLETED, null)
+            return StepResult.Completed
+        }
+        when (val claimed = claimTransfer(request, action.relativePath, TransferDirection.UPLOAD, bytes.size.toLong())) {
+            is Claim.Later -> return StepResult.Waiting(claimed.reason)
+            is Claim.Go -> {
+                val transfer = claimed.transfer
+                try {
+                    val result = remote.upload(
+                        request.endpoint,
+                        fullRemote(request.folder, action.relativePath),
+                        ContentSource { bytes.inputStream() },
+                        bytes.size.toLong(),
+                        "application/octet-stream",
+                        action.ifMatch,
+                        uploadId = transfer.uploadId,
+                        resumeFromChunk = transfer.nextChunk.coerceAtLeast(1),
+                        onProgress = { progress ->
+                            val current = stored(transfer)
+                            state.saveTransfer(
+                                current.copy(
+                                    uploadId = progress.uploadId,
+                                    nextChunk = progress.nextChunk,
+                                    bytesTransferred = progress.bytesTransferred,
+                                    status = TransferStatus.RUNNING,
+                                    updatedAt = clock.nowMillis(),
+                                ),
+                            )
+                        },
+                    )
+                    val version = recorder.snapshot(key(request, action.relativePath), VersionOrigin.UPLOAD, bytes, remoteEtag = result.etag)
+                    saveTracked(
+                        tracked,
+                        existing,
+                        request,
+                        action.relativePath,
+                        hash,
+                        result.etag,
+                        version.id,
+                        TrackedState.IN_SYNC,
+                        bytes.size.toLong(),
+                    )
+                    finishTransfer(stored(transfer), TransferStatus.COMPLETED, null)
+                    return StepResult.Completed
+                } catch (error: RemoteChangedException) {
+                    finishTransfer(stored(transfer), TransferStatus.FAILED, error.message)
+                    recordConflict(request, tracked, action.relativePath, ConflictKind.CONTENT, "The server copy changed during the upload.", null, null, null)
+                    return StepResult.Completed
+                } catch (error: Exception) {
+                    failTransfer(transfer, error)
+                }
+            }
         }
     }
 
-    private suspend fun download(request: SyncRequest, tracked: MutableList<TrackedFile>, action: PlannedAction.Download) {
+    private suspend fun download(request: SyncRequest, tracked: MutableList<TrackedFile>, action: PlannedAction.Download): StepResult {
         val existing = find(tracked, action.relativePath)
-        val before = if (local.exists(request.folder.localRoot, action.relativePath)) local.sha256(request.folder.localRoot, action.relativePath) else null
-        val transfer = beginTransfer(request, action.relativePath, TransferDirection.DOWNLOAD, 0)
-        val downloaded = remote.download(request.endpoint, fullRemote(request.folder, action.relativePath), null)
-        val after = if (local.exists(request.folder.localRoot, action.relativePath)) local.sha256(request.folder.localRoot, action.relativePath) else null
-        if (before != after) {
-            finishTransfer(transfer, TransferStatus.FAILED, "Local file changed during download.")
-            recordConflict(request, tracked, action.relativePath, ConflictKind.CONTENT, "The local file changed while it was being downloaded.", null, null, null)
-            return
+        when (val claimed = claimTransfer(request, action.relativePath, TransferDirection.DOWNLOAD, 0)) {
+            is Claim.Later -> return StepResult.Waiting(claimed.reason)
+            is Claim.Go -> {
+                val transfer = claimed.transfer
+                try {
+                    val before = if (local.exists(request.folder.localRoot, action.relativePath)) local.sha256(request.folder.localRoot, action.relativePath) else null
+                    val downloaded = remote.download(request.endpoint, fullRemote(request.folder, action.relativePath), null)
+                    val after = if (local.exists(request.folder.localRoot, action.relativePath)) local.sha256(request.folder.localRoot, action.relativePath) else null
+                    if (before != after) {
+                        finishTransfer(stored(transfer), TransferStatus.FAILED, "Local file changed during download.")
+                        recordConflict(request, tracked, action.relativePath, ConflictKind.CONTENT, "The local file changed while it was being downloaded.", null, null, null)
+                        return StepResult.Completed
+                    }
+                    if (before != null) {
+                        recorder.snapshot(key(request, action.relativePath), VersionOrigin.LOCAL, local.read(request.folder.localRoot, action.relativePath))
+                    }
+                    local.writeAtomically(request.folder.localRoot, action.relativePath, downloaded.bytes)
+                    val hash = ContentHash.sha256(downloaded.bytes)
+                    val version = recorder.snapshot(key(request, action.relativePath), VersionOrigin.DOWNLOAD, downloaded.bytes, remoteEtag = downloaded.etag)
+                    saveTracked(tracked, existing, request, action.relativePath, hash, downloaded.etag, version.id, TrackedState.IN_SYNC, downloaded.bytes.size.toLong())
+                    val size = downloaded.bytes.size.toLong()
+                    finishTransfer(stored(transfer).copy(totalBytes = size, bytesTransferred = size), TransferStatus.COMPLETED, null)
+                    return StepResult.Completed
+                } catch (error: Exception) {
+                    failTransfer(transfer, error)
+                }
+            }
         }
-        if (before != null) {
-            recorder.snapshot(key(request, action.relativePath), VersionOrigin.LOCAL, local.read(request.folder.localRoot, action.relativePath))
-        }
-        local.writeAtomically(request.folder.localRoot, action.relativePath, downloaded.bytes)
-        val hash = ContentHash.sha256(downloaded.bytes)
-        val version = recorder.snapshot(key(request, action.relativePath), VersionOrigin.DOWNLOAD, downloaded.bytes, remoteEtag = downloaded.etag)
-        saveTracked(tracked, existing, request, action.relativePath, hash, downloaded.etag, version.id, TrackedState.IN_SYNC, downloaded.bytes.size.toLong())
-        finishTransfer(transfer.copy(totalBytes = downloaded.bytes.size.toLong(), bytesTransferred = downloaded.bytes.size.toLong()), TransferStatus.COMPLETED, null)
     }
 
     private suspend fun merge(request: SyncRequest, tracked: MutableList<TrackedFile>, action: PlannedAction.Merge): Boolean {
@@ -619,6 +718,108 @@ class SyncEngine(
         tracked += file
     }
 
+    private suspend fun claimTransfer(
+        request: SyncRequest,
+        relative: String,
+        direction: TransferDirection,
+        size: Long,
+    ): Claim {
+        val now = clock.nowMillis()
+        val existing = openTransfer(request, relative, direction)
+        if (existing != null) {
+            if (existing.retryCount >= RetryPolicy.MAX_ATTEMPTS) {
+                val failed = existing.copy(
+                    status = TransferStatus.FAILED,
+                    error = existing.error ?: "Stopped after ${existing.retryCount} attempts.",
+                    updatedAt = now,
+                )
+                state.saveTransfer(failed)
+                return Claim.Later(failed.error ?: "Stopped retrying this transfer.")
+            }
+            val retryAt = existing.nextRetryAt
+            if (existing.status == TransferStatus.QUEUED && retryAt != null && retryAt > now) {
+                return Claim.Later(existing.error ?: "Waiting to retry this transfer.")
+            }
+            val running = existing.copy(
+                status = TransferStatus.RUNNING,
+                totalBytes = if (size > 0) size else existing.totalBytes,
+                updatedAt = now,
+            )
+            state.saveTransfer(running)
+            return Claim.Go(running)
+        }
+        return Claim.Go(beginTransfer(request, relative, direction, size))
+    }
+
+    private suspend fun openTransfer(request: SyncRequest, relative: String, direction: TransferDirection): Transfer? = state.transfers(request.folder.id)
+        .filter {
+            it.localPath == relative &&
+                it.direction == direction &&
+                it.status != TransferStatus.COMPLETED &&
+                it.status != TransferStatus.CANCELLED &&
+                it.status != TransferStatus.FAILED
+        }
+        .maxByOrNull { it.updatedAt }
+
+    private suspend fun failTransfer(transfer: Transfer, error: Exception): Nothing {
+        if (error is CancellationException) {
+            finishTransfer(stored(transfer), TransferStatus.QUEUED, error.message)
+            throw error
+        }
+        val current = stored(transfer)
+        val now = clock.nowMillis()
+        if (RetryPolicy.shouldRetry(error, current.retryCount)) {
+            val delay = RetryPolicy.nextDelayMillis(current.retryCount) ?: 0L
+            state.saveTransfer(
+                current.copy(
+                    status = TransferStatus.QUEUED,
+                    retryCount = current.retryCount + 1,
+                    nextRetryAt = now + delay,
+                    error = error.message,
+                    updatedAt = now,
+                ),
+            )
+        } else {
+            state.saveTransfer(
+                current.copy(
+                    status = TransferStatus.FAILED,
+                    error = error.message ?: error.javaClass.simpleName,
+                    updatedAt = now,
+                ),
+            )
+        }
+        throw error
+    }
+
+    private suspend fun stored(transfer: Transfer): Transfer {
+        val folderId = transfer.folderId ?: return transfer
+        return state.transfers(folderId).firstOrNull { it.id == transfer.id } ?: transfer
+    }
+
+    private suspend fun finishOpen(
+        request: SyncRequest,
+        relative: String,
+        direction: TransferDirection,
+        status: TransferStatus,
+        error: String?,
+    ) {
+        val open = openTransfer(request, relative, direction) ?: return
+        finishTransfer(open, status, error)
+    }
+
+    private suspend fun settleTransfers(request: SyncRequest, finished: Set<String>, deferred: Set<String>) {
+        for (transfer in state.transfers(request.folder.id)) {
+            if (transfer.localPath !in finished || transfer.localPath in deferred) continue
+            if (transfer.status == TransferStatus.QUEUED ||
+                transfer.status == TransferStatus.RUNNING ||
+                transfer.status == TransferStatus.WAITING_NETWORK ||
+                transfer.status == TransferStatus.PAUSED
+            ) {
+                finishTransfer(transfer, TransferStatus.COMPLETED, null)
+            }
+        }
+    }
+
     private suspend fun beginTransfer(request: SyncRequest, relative: String, direction: TransferDirection, size: Long): Transfer {
         val transfer = Transfer(
             id = ids.newId(),
@@ -687,4 +888,16 @@ class SyncEngine(
     private fun fullRemote(folder: SyncFolder, relative: String): String = SyncPaths.child(folder.remotePath, relative).let { "/$it" }
 
     private fun report(folderId: String, status: FolderStatus, uploaded: Int, downloaded: Int, conflicts: Int, waiting: String?, errors: List<String>) = SyncReport(folderId, status, uploaded, downloaded, conflicts, waiting, errors)
+
+    private sealed interface StepResult {
+        data object Completed : StepResult
+
+        data class Waiting(val reason: String) : StepResult
+    }
+
+    private sealed interface Claim {
+        data class Go(val transfer: Transfer) : Claim
+
+        data class Later(val reason: String) : Claim
+    }
 }

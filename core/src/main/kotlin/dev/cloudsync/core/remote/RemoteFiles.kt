@@ -18,6 +18,8 @@ data class DownloadResult(val bytes: ByteArray, val etag: String?, val contentTy
 
 data class UploadResult(val etag: String?, val fileId: String?)
 
+data class UploadProgress(val uploadId: String, val nextChunk: Int, val bytesTransferred: Long)
+
 data class RemoteVersion(val href: String, val versionId: String, val size: Long, val modifiedAtEpochMillis: Long?, val etag: String?)
 
 fun interface ContentSource {
@@ -44,6 +46,7 @@ interface RemoteFiles {
         ifMatch: String?,
         uploadId: String? = null,
         resumeFromChunk: Int = 1,
+        onProgress: (suspend (UploadProgress) -> Unit)? = null,
     ): UploadResult
 
     suspend fun delete(account: AccountEndpoint, path: String, ifMatch: String?)

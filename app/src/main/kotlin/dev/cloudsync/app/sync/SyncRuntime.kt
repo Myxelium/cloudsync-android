@@ -54,6 +54,7 @@ import dev.cloudsync.database.toModel
 import dev.cloudsync.sync.SyncEngine
 import dev.cloudsync.sync.SyncRequest
 import dev.cloudsync.sync.SyncSchedule
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -253,6 +254,7 @@ class SyncCoordinator @Inject constructor(
         database.jobs().upsert(
             dev.cloudsync.database.SyncJobEntity(ids.newId(), folder.id, "RUNNING", clock.nowMillis(), clock.nowMillis(), null),
         )
+        var rethrow: Exception? = null
         val report = try {
             engine.synchronize(
                 SyncRequest(
@@ -262,10 +264,21 @@ class SyncCoordinator @Inject constructor(
                     isCancelled = { folder.id in cancelled },
                 ),
             )
+        } catch (error: CancellationException) {
+            rethrow = error
+            SyncReport(folder.id, FolderStatus.IDLE, 0, 0, 0, "Cancelled.", emptyList())
         } catch (error: AuthenticationException) {
             database.accounts().upsert(account.copy(status = AccountStatus.AUTH_EXPIRED).toEntity())
             notifications.authentication(account.serverUrl)
             SyncReport(folder.id, FolderStatus.ERROR, 0, 0, 0, null, listOf(error.message ?: "Sign in again."))
+        } catch (error: Exception) {
+            val message = error.message ?: "Synchronization failed."
+            if (isRetryable(error)) {
+                rethrow = error
+                SyncReport(folder.id, FolderStatus.WAITING_NETWORK, 0, 0, 0, message, emptyList())
+            } else {
+                SyncReport(folder.id, FolderStatus.ERROR, 0, 0, 0, null, listOf(message))
+            }
         }
         val success = report.errors.isEmpty() && report.status != FolderStatus.ERROR
         database.folders().upsert(
@@ -287,6 +300,7 @@ class SyncCoordinator @Inject constructor(
         )
         notifications.finished(folder, report)
         if (report.conflicts > 0) notifications.conflicts(report.conflicts)
+        rethrow?.let { throw it }
         report
     }
 

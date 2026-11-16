@@ -4,6 +4,7 @@ import dev.cloudsync.core.error.RemoteChangedException
 import dev.cloudsync.core.model.AccountEndpoint
 import dev.cloudsync.core.remote.ContentSource
 import dev.cloudsync.core.remote.CredentialsProvider
+import dev.cloudsync.core.remote.UploadProgress
 import kotlinx.coroutines.runBlocking
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -79,6 +80,40 @@ class WebDavClientTest {
             assertEquals("assembled", result.etag)
             val methods = (1..5).map { server.takeRequest().method }
             assertEquals(listOf("MKCOL", "PUT", "PUT", "PUT", "MOVE"), methods)
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun resumedChunkedUploadAssemblesWithoutRepeatingChunks() = runBlocking<Unit> {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse.Builder().code(201).build())
+            server.enqueue(MockResponse.Builder().code(201).setHeader("ETag", "\"assembled\"").build())
+            val endpoint = account.copy(serverUrl = server.url("/").toString().trimEnd('/'))
+            val client = WebDavClient(OkHttpClient(), StaticSecret("secret"), chunkSize = 4)
+            val progress = mutableListOf<UploadProgress>()
+            val result = client.upload(
+                endpoint,
+                "/big.bin",
+                source("abcdefghij"),
+                10,
+                "application/octet-stream",
+                "base-etag",
+                uploadId = "cloudsync-resume",
+                resumeFromChunk = 3,
+                onProgress = { progress += it },
+            )
+            assertEquals("assembled", result.etag)
+            val requests = (1..2).map { server.takeRequest() }
+            assertEquals(listOf("PUT", "MOVE"), requests.map { it.method })
+            assertTrue(requests[0].url.encodedPath.contains("/cloudsync-resume/00003"))
+            assertTrue(requests[1].url.encodedPath.contains("/cloudsync-resume/.file"))
+            assertEquals("10", requests[1].headers["OC-Total-Length"])
+            assertEquals("\"base-etag\"", requests[1].headers["If-Match"])
+            assertTrue(progress.any { it.uploadId == "cloudsync-resume" && it.nextChunk > 3 })
         } finally {
             server.close()
         }

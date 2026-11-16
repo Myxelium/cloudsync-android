@@ -69,9 +69,13 @@ jobs:
           "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "platforms;android-37.0" "platforms;android-34" "build-tools;36.0.0" "platform-tools"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "sdk.dir=$SDK" > local.properties
+      - name: Build instrumented tests
+        run: ./gradlew assembleDebug assembleDebugAndroidTest --stacktrace
       - name: Instrumented tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 34
           arch: x86_64
+          disable-animations: true
+          emulator-boot-timeout: 900
           script: ./gradlew connectedDebugAndroidTest --stacktrace
