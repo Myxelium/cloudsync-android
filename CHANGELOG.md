@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.1](https://github.com/Myxelium/cloudsync-android/compare/v1.1.0...v1.1.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* keep the emulator job alive when animation settings fail ([17194df](https://github.com/Myxelium/cloudsync-android/commit/17194dfbcc2fe6804271d86a44826e9c4b810fe8))
+* list folders when Android rejects the XML secure-processing feature ([e616927](https://github.com/Myxelium/cloudsync-android/commit/e616927bf607e57b227104d9d317ca58dcbd7641))
+* run the emulator test script with bash ([274cba7](https://github.com/Myxelium/cloudsync-android/commit/274cba78e8647ccf375738a869a83f1d55cce8af))
+
 ## [1.1.0](https://github.com/Myxelium/cloudsync-android/compare/v1.0.0...v1.1.0) (2026-11-16)
 
 
