@@ -19,6 +19,8 @@ import dev.cloudsync.core.remote.RemoteNode
 import dev.cloudsync.core.remote.RemoteVersion
 import dev.cloudsync.core.remote.UploadProgress
 import dev.cloudsync.core.remote.UploadResult
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -31,16 +33,20 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import java.io.IOException
 import java.net.URLEncoder
 import java.util.UUID
 
 class WebDavClient(
-    private val http: OkHttpClient,
+    http: OkHttpClient,
     private val credentials: CredentialsProvider,
     private val chunkSize: Int = DEFAULT_CHUNK,
 ) : RemoteFiles {
+    // 301 and 302 otherwise become GET for every method except PROPFIND, which drops the MOVE/PUT/MKCOL body.
+    private val direct = http.newBuilder().followRedirects(false).followSslRedirects(false).build()
+
     override suspend fun list(account: AccountEndpoint, directoryPath: String): List<RemoteNode> {
-        val url = filesUrl(account, directoryPath)
+        val url = filesUrl(account, directoryPath, directory = true)
         val nodes = propfind(account, url, "1")
         val root = normalizePath(directoryPath)
         return nodes.filter { it.path.trimEnd('/') != root.trimEnd('/') }
@@ -49,8 +55,8 @@ class WebDavClient(
     override suspend fun stat(account: AccountEndpoint, path: String): RemoteNode? {
         val url = filesUrl(account, path)
         return try {
-            propfind(account, url, "0").firstOrNull { it.path.trimEnd('/') == normalizePath(path).trimEnd('/') }
-                ?: propfind(account, url, "0").firstOrNull()
+            val nodes = propfind(account, url, "0")
+            nodes.firstOrNull { it.path.trimEnd('/') == normalizePath(path).trimEnd('/') } ?: nodes.firstOrNull()
         } catch (_: NotFoundException) {
             null
         }
@@ -59,19 +65,21 @@ class WebDavClient(
     override suspend fun download(account: AccountEndpoint, path: String, ifNoneMatch: String?): DownloadResult {
         val request = base(account, filesUrl(account, path)).get()
         if (ifNoneMatch != null) request.header("If-None-Match", Etags.headerValue(ifNoneMatch))
-        execute(request.build()).use { response ->
+        return exchange(request.build()) { response ->
             if (response.code == 304) {
-                return DownloadResult(ByteArray(0), ifNoneMatch, null, true, 0)
+                DownloadResult(ByteArray(0), ifNoneMatch, null, true, 0)
+            } else {
+                ensureSuccess(response)
+                val type = response.body.contentType()?.toString()
+                val bytes = response.body.bytes()
+                DownloadResult(
+                    bytes = bytes,
+                    etag = Etags.normalize(response.header("ETag")),
+                    contentType = type,
+                    notModified = false,
+                    totalSize = bytes.size.toLong(),
+                )
             }
-            ensureSuccess(response)
-            val bytes = response.body.bytes()
-            return DownloadResult(
-                bytes = bytes,
-                etag = Etags.normalize(response.header("ETag")),
-                contentType = response.body.contentType()?.toString(),
-                notModified = false,
-                totalSize = bytes.size.toLong(),
-            )
         }
     }
 
@@ -89,13 +97,13 @@ class WebDavClient(
         if (size > chunkSize) {
             return uploadChunked(account, path, source, size, ifMatch, uploadId, resumeFromChunk, onProgress)
         }
-        val bytes = source.open().use { it.readBytes() }
+        val bytes = withContext(Dispatchers.IO) { source.open().use { it.readBytes() } }
         val builder = base(account, filesUrl(account, path))
             .put(bytes.toRequestBody(contentType.toMediaType()))
         if (ifMatch != null) builder.header("If-Match", Etags.headerValue(ifMatch))
-        execute(builder.build()).use { response ->
+        return exchange(builder.build()) { response ->
             ensureSuccess(response)
-            return UploadResult(
+            UploadResult(
                 Etags.normalize(response.header("ETag")) ?: Etags.normalize(response.header("OC-ETag")),
                 response.header("OC-FileId"),
             )
@@ -105,14 +113,13 @@ class WebDavClient(
     override suspend fun delete(account: AccountEndpoint, path: String, ifMatch: String?) {
         val builder = base(account, filesUrl(account, path)).delete()
         if (ifMatch != null) builder.header("If-Match", Etags.headerValue(ifMatch))
-        execute(builder.build()).use { ensureSuccess(it) }
+        exchange(builder.build()) { ensureSuccess(it) }
     }
 
     override suspend fun createDirectory(account: AccountEndpoint, path: String) {
-        val request = base(account, filesUrl(account, path)).method("MKCOL", ByteArray(0).toRequestBody(null)).build()
-        execute(request).use { response ->
-            if (response.code == 405) return
-            ensureSuccess(response)
+        val request = base(account, filesUrl(account, path, directory = true)).method("MKCOL", ByteArray(0).toRequestBody(null)).build()
+        exchange(request) { response ->
+            if (response.code != 405) ensureSuccess(response)
         }
     }
 
@@ -128,35 +135,36 @@ class WebDavClient(
         val url = account.serverUrl.trimEnd('/') +
             "/ocs/v2.php/search/providers/files/search?term=" + encode(term)
         val request = base(account, url).get().header("OCS-APIRequest", "true").header("Accept", "application/json").build()
-        execute(request).use { response ->
+        return exchange(request) { response ->
             ensureSuccess(response)
-            return parseSearch(account, response.body.string())
+            parseSearch(account, response.body.string())
         }
     }
 
     override suspend fun listVersions(account: AccountEndpoint, fileId: String): List<RemoteVersion> {
         val url = versionsCollection(account, fileId)
         val request = base(account, url).method("PROPFIND", PROPFIND_BODY.toRequestBody(XML)).header("Depth", "1").build()
-        execute(request).use { response ->
-            if (response.code == 404) return emptyList()
-            ensureSuccess(response)
-            return PropfindParser.parse(response.body.string(), url).map { node ->
-                RemoteVersion(
-                    href = versionsCollection(account, fileId).trimEnd('/') + "/" + node.path.trim('/').substringAfterLast('/'),
-                    versionId = node.path.trim('/').substringAfterLast('/'),
-                    size = node.size,
-                    modifiedAtEpochMillis = node.modifiedAtEpochMillis,
-                    etag = node.etag,
-                )
-            }.filter { it.versionId.isNotEmpty() && it.versionId != fileId }
+        return exchange(request) { response ->
+            if (response.code == 404) {
+                emptyList()
+            } else {
+                ensureSuccess(response)
+                PropfindParser.parse(response.body.string(), url).map { node ->
+                    RemoteVersion(
+                        href = versionsCollection(account, fileId).trimEnd('/') + "/" + node.path.trim('/').substringAfterLast('/'),
+                        versionId = node.path.trim('/').substringAfterLast('/'),
+                        size = node.size,
+                        modifiedAtEpochMillis = node.modifiedAtEpochMillis,
+                        etag = node.etag,
+                    )
+                }.filter { it.versionId.isNotEmpty() && it.versionId != fileId }
+            }
         }
     }
 
-    override suspend fun downloadVersion(account: AccountEndpoint, href: String): ByteArray {
-        execute(base(account, href).get().build()).use { response ->
-            ensureSuccess(response)
-            return response.body.bytes()
-        }
+    override suspend fun downloadVersion(account: AccountEndpoint, href: String): ByteArray = exchange(base(account, href).get().build()) { response ->
+        ensureSuccess(response)
+        response.body.bytes()
     }
 
     override suspend fun restoreVersion(account: AccountEndpoint, href: String, destinationPath: String) {
@@ -165,7 +173,7 @@ class WebDavClient(
             .header("Destination", filesUrl(account, destinationPath))
             .header("Overwrite", "T")
             .build()
-        execute(request).use { ensureSuccess(it) }
+        exchange(request) { ensureSuccess(it) }
     }
 
     private suspend fun uploadChunked(
@@ -177,7 +185,7 @@ class WebDavClient(
         existingUploadId: String?,
         resumeFromChunk: Int,
         onProgress: (suspend (UploadProgress) -> Unit)?,
-    ): UploadResult {
+    ): UploadResult = withContext(Dispatchers.IO) {
         val uploadId = existingUploadId ?: "cloudsync-${UUID.randomUUID()}"
         val destination = filesUrl(account, path)
         val collection = uploadsUrl(account, uploadId)
@@ -193,7 +201,7 @@ class WebDavClient(
                 .method("MKCOL", ByteArray(0).toRequestBody(null))
                 .header("Destination", destination)
                 .build()
-            execute(create).use { response ->
+            exchange(create) { response ->
                 if (response.code != 405) ensureSuccess(response)
             }
         }
@@ -211,7 +219,7 @@ class WebDavClient(
                         .header("Destination", destination)
                         .header("OC-Total-Length", size.toString())
                         .build()
-                    execute(put).use { ensureSuccess(it) }
+                    exchange(put) { ensureSuccess(it) }
                     bytesSent += read
                     nextChunk = chunk + 1
                     report(nextChunk)
@@ -230,9 +238,9 @@ class WebDavClient(
             .header("OC-Total-Length", size.toString())
             .header("Overwrite", "T")
         if (ifMatch != null) assemble.header("If-Match", Etags.headerValue(ifMatch))
-        execute(assemble.build()).use { response ->
+        exchange(assemble.build()) { response ->
             ensureSuccess(response)
-            return UploadResult(
+            UploadResult(
                 Etags.normalize(response.header("ETag")) ?: Etags.normalize(response.header("OC-ETag")),
                 response.header("OC-FileId"),
             )
@@ -251,9 +259,9 @@ class WebDavClient(
 
     private suspend fun propfind(account: AccountEndpoint, url: String, depth: String): List<RemoteNode> {
         val request = base(account, url).method("PROPFIND", PROPFIND_BODY.toRequestBody(XML)).header("Depth", depth).build()
-        execute(request).use { response ->
+        return exchange(request) { response ->
             ensureSuccess(response)
-            return PropfindParser.parse(response.body.string(), filesUrl(account, "/"))
+            PropfindParser.parse(response.body.string(), filesUrl(account, "/"))
         }
     }
 
@@ -263,7 +271,7 @@ class WebDavClient(
             .header("Destination", filesUrl(account, to))
             .header("Overwrite", if (overwrite) "T" else "F")
             .build()
-        execute(request).use { ensureSuccess(it) }
+        exchange(request) { ensureSuccess(it) }
     }
 
     private suspend fun base(account: AccountEndpoint, url: String): Request.Builder {
@@ -275,10 +283,43 @@ class WebDavClient(
             .header("User-Agent", HttpClients.USER_AGENT)
     }
 
-    private fun execute(request: Request): Response = try {
-        http.newCall(request).execute()
-    } catch (error: java.io.IOException) {
-        throw NetworkException("The network request failed.", error)
+    /**
+     * Reads the response off the main thread. A blocking call there throws NetworkOnMainThreadException,
+     * and that exception has no message, so the files screen can only say the folder could not be opened.
+     * Redirects are repeated with the same method: Nextcloud answers a folder or front-controller move with 301/302.
+     */
+    private suspend fun <T> exchange(request: Request, block: (Response) -> T): T = withContext(Dispatchers.IO) {
+        var current = request
+        repeat(MAX_REDIRECTS) {
+            val response = try {
+                direct.newCall(current).execute()
+            } catch (error: IOException) {
+                throw NetworkException("The network request failed.", error)
+            }
+            response.use {
+                if (it.code == 301 || it.code == 302 || it.code == 307 || it.code == 308) {
+                    current = redirected(current, it)
+                    return@use
+                }
+                return@withContext block(it)
+            }
+        }
+        throw CloudSyncException("Nextcloud redirected this request too many times.")
+    }
+
+    private fun redirected(request: Request, response: Response): Request {
+        val location = response.header("Location")?.takeIf { it.isNotBlank() }
+            ?: throw CloudSyncException("Nextcloud redirected this request without a destination.")
+        val next = response.request.url.resolve(location)
+            ?: throw CloudSyncException("Nextcloud redirected this request to an invalid address.")
+        if (!next.host.equals(request.url.host, ignoreCase = true) || next.port != request.url.port) {
+            throw CloudSyncException("Nextcloud redirected this request to another server.")
+        }
+        if (request.url.scheme == "https" && next.scheme != "https") {
+            throw CloudSyncException("Nextcloud redirected this request away from HTTPS.")
+        }
+        if (next == request.url) throw CloudSyncException("Nextcloud redirected this request to itself.")
+        return request.newBuilder().url(next).build()
     }
 
     private fun ensureSuccess(response: Response) {
@@ -304,33 +345,51 @@ class WebDavClient(
         val entries = root["ocs"]?.jsonObject?.get("data")?.jsonObject?.get("entries")?.jsonArray ?: return emptyList()
         return entries.mapNotNull { element ->
             val obj = element as? JsonObject ?: return@mapNotNull null
-            val resource = obj["resourceUrl"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-            val marker = "/remote.php/dav/files/${encode(account.userId)}"
-            val index = resource.indexOf("/remote.php/dav/files/")
-            if (index < 0) return@mapNotNull null
-            val path = java.net.URLDecoder.decode(resource.substring(resource.indexOf("/remote.php/dav/files/")), Charsets.UTF_8)
-            val relative = path.substringAfter("/remote.php/dav/files/${account.userId}", "")
-            if (relative.isEmpty()) return@mapNotNull null
+            val attributes = obj["attributes"] as? JsonObject
+            val attributePath = attributes?.stringOrNull("path")
+            val path = when {
+                !attributePath.isNullOrBlank() -> normalizePath(attributePath)
+                else -> pathFromDavUrl(account, obj["resourceUrl"]?.jsonPrimitive?.contentOrNull)
+            } ?: return@mapNotNull null
+            val icon = obj["icon"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val directory = icon == "icon-folder" || icon.endsWith("/folder.svg") || path.endsWith("/")
             RemoteNode(
-                path = if (relative.startsWith("/")) relative else "/$relative",
-                directory = false,
+                path = if (directory) path.trimEnd('/').ifEmpty { "/" } else path,
+                directory = directory,
                 etag = null,
-                size = obj["size"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0,
+                size = attributes?.stringOrNull("size")?.toLongOrNull() ?: 0,
                 modifiedAtEpochMillis = null,
                 contentType = null,
-                fileId = null,
+                fileId = attributes?.stringOrNull("fileId"),
                 permissions = null,
-            ).let { node ->
-                if (resource.contains(marker) || path.contains("/${account.userId}/") || path.endsWith("/${account.userId}")) node else node
-            }
+            )
         }
     }
 
-    private fun filesUrl(account: AccountEndpoint, path: String): String {
+    private fun pathFromDavUrl(account: AccountEndpoint, resource: String?): String? {
+        if (resource.isNullOrBlank()) return null
+        val marker = "/remote.php/dav/files/"
+        val decoded = PropfindParser.decodeHref(resource.substringBefore('?'))
+        val index = decoded.indexOf(marker)
+        if (index < 0) return null
+        val remainder = decoded.substring(index + marker.length).trim('/')
+        val user = remainder.substringBefore('/')
+        if (user != account.userId) return null
+        val afterUser = remainder.substringAfter('/', "")
+        return if (afterUser.isEmpty()) "/" else "/${afterUser.trim('/')}"
+    }
+
+    private fun JsonObject.stringOrNull(name: String): String? {
+        val value = this[name] as? kotlinx.serialization.json.JsonPrimitive ?: return null
+        return value.contentOrNull
+    }
+
+    private fun filesUrl(account: AccountEndpoint, path: String, directory: Boolean = false): String {
         val root = account.serverUrl.trimEnd('/') + "/remote.php/dav/files/" + encode(account.userId)
         val relative = path.trim('/')
         if (relative.isEmpty()) return "$root/"
-        return root + "/" + relative.split('/').joinToString("/") { encode(it) }
+        val encoded = root + "/" + relative.split('/').joinToString("/") { encode(it) }
+        return if (directory) "$encoded/" else encoded
     }
 
     private fun uploadsUrl(account: AccountEndpoint, uploadId: String): String = account.serverUrl.trimEnd('/') + "/remote.php/dav/uploads/" + encode(account.userId) + "/" + encode(uploadId)
@@ -349,8 +408,9 @@ class WebDavClient(
         const val DEFAULT_CHUNK = 5 * 1024 * 1024
         val XML = "application/xml; charset=utf-8".toMediaType()
         val OCTET = "application/octet-stream".toMediaType()
+        const val MAX_REDIRECTS = 5
         val PROPFIND_BODY = """
-            <?xml version="1.0"?>
+            <?xml version="1.0" encoding="UTF-8"?>
             <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
               <d:prop>
                 <d:getlastmodified/>
