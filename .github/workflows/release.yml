@@ -3,6 +3,12 @@ name: Release
 on:
   release:
     types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build and attach
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -58,15 +66,17 @@ jobs:
         run: |
           set -euo pipefail
           APK=$(find app/build/outputs/apk/release -name '*.apk' | head -n 1)
-          cp "$APK" "cloudsync-${{ github.event.release.tag_name }}.apk"
-          sha256sum "cloudsync-${{ github.event.release.tag_name }}.apk" > SHA256SUMS
-          echo "tag ${{ github.event.release.tag_name }}" >> SHA256SUMS
+          TAG="${{ inputs.tag || github.event.release.tag_name }}"
+          cp "$APK" "cloudsync-${TAG}.apk"
+          sha256sum "cloudsync-${TAG}.apk" > SHA256SUMS
+          echo "tag ${TAG}" >> SHA256SUMS
           echo "commit ${GITHUB_SHA}" >> SHA256SUMS
       - name: Attach to the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: >
-          gh release upload "${{ github.event.release.tag_name }}"
-          "cloudsync-${{ github.event.release.tag_name }}.apk"
+          gh release upload "$TAG"
+          "cloudsync-${TAG}.apk"
           SHA256SUMS
           --clobber
