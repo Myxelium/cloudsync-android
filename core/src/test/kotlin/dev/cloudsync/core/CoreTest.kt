@@ -42,6 +42,8 @@ class CoreTest {
     fun serverUrlsRequireHttpsWithoutCredentials() {
         assertEquals("https://cloud.example.com", ServerUrls.normalize("cloud.example.com"))
         assertEquals("https://cloud.example.com:8443", ServerUrls.normalize("https://cloud.example.com:8443/"))
+        assertEquals("https://cloud.example.com/nextcloud", ServerUrls.normalize("https://cloud.example.com/nextcloud/"))
+        assertEquals("https://cloud.example.com/nextcloud", ServerUrls.normalize("https://cloud.example.com/nextcloud/index.php"))
         assertFailsWith<ValidationException> { ServerUrls.normalize("http://cloud.example.com") }
         assertFailsWith<ValidationException> { ServerUrls.normalize("https://user:secret@cloud.example.com") }
         assertFailsWith<ValidationException> { ServerUrls.normalize("https://localhost") }

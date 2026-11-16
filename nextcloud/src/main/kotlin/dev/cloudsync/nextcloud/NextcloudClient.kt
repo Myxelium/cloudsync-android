@@ -12,6 +12,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Credentials
 import okhttp3.FormBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
@@ -21,6 +22,8 @@ data class LoginChallenge(val token: String, val endpoint: String, val loginUrl:
 sealed interface LoginPoll {
     data object Pending : LoginPoll
 
+    data object Throttled : LoginPoll
+
     data class Success(val server: String, val loginName: String, val appPassword: String) : LoginPoll
 }
 
@@ -29,6 +32,7 @@ data class ServerInfo(val serverUrl: String, val version: String?, val product: 
 data class CloudUser(val userId: String, val displayName: String)
 
 class LoginFlowClient(private val http: OkHttpClient, private val requireHttps: Boolean = true) {
+    private val direct = http.newBuilder().followRedirects(false).followSslRedirects(false).build()
     fun start(serverUrl: String): LoginChallenge {
         val server = canonical(serverUrl)
         val request = Request.Builder()
@@ -47,31 +51,53 @@ class LoginFlowClient(private val http: OkHttpClient, private val requireHttps: 
     }
 
     fun poll(endpoint: String, token: String): LoginPoll {
-        val request = Request.Builder()
-            .url(endpoint)
-            .header("User-Agent", HttpClients.USER_AGENT)
-            .post(FormBody.Builder().add("token", token).build())
-            .build()
-        val response = try {
-            http.newCall(request).execute()
-        } catch (error: IOException) {
-            throw NetworkException("Could not reach the Nextcloud server.", error)
-        }
-        response.use {
-            if (it.code == 404) return LoginPoll.Pending
-            if (!it.isSuccessful) {
-                throw CloudSyncException("Login polling failed (${it.code}).")
+        var url = endpoint.toHttpUrl()
+        repeat(MAX_REDIRECTS) {
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", HttpClients.USER_AGENT)
+                .post(FormBody.Builder().add("token", token).build())
+                .build()
+            val response = try {
+                direct.newCall(request).execute()
+            } catch (error: IOException) {
+                throw NetworkException("Could not reach the Nextcloud server.", error)
             }
-            val json = Json.parseToJsonElement(it.body.string()).jsonObject
-            return LoginPoll.Success(
-                server = canonical(json.string("server")),
-                loginName = json.string("loginName"),
-                appPassword = json.string("appPassword"),
-            )
+            response.use {
+                when (it.code) {
+                    404, 303 -> return LoginPoll.Pending
+                    429 -> return LoginPoll.Throttled
+                    301, 302, 307, 308 -> {
+                        val location = it.header("Location")
+                            ?: throw CloudSyncException("Nextcloud redirected the login poll without a destination.")
+                        val next = it.request.url.resolve(location)
+                            ?: throw CloudSyncException("Nextcloud redirected the login poll to an invalid address.")
+                        if (requireHttps && next.scheme != "https") {
+                            throw CloudSyncException("Nextcloud redirected the login poll away from HTTPS.")
+                        }
+                        url = next
+                    }
+                    in 200..299 -> {
+                        val json = runCatching { Json.parseToJsonElement(it.body.string()).jsonObject }.getOrNull()
+                            ?: throw CloudSyncException("Nextcloud did not return login credentials.")
+                        return LoginPoll.Success(
+                            server = canonical(json.string("server")),
+                            loginName = json.string("loginName"),
+                            appPassword = json.string("appPassword"),
+                        )
+                    }
+                    else -> throw CloudSyncException("Login polling failed (${it.code}).")
+                }
+            }
         }
+        throw CloudSyncException("Nextcloud redirected the login poll too many times.")
     }
 
     private fun canonical(serverUrl: String): String = if (requireHttps) ServerUrls.normalize(serverUrl) else serverUrl.trimEnd('/')
+
+    private companion object {
+        const val MAX_REDIRECTS = 5
+    }
 
     private fun call(request: Request): String {
         val response = try {

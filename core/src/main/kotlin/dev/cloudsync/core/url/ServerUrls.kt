@@ -35,6 +35,17 @@ object ServerUrls {
             throw ValidationException("The server host name is not valid.")
         }
         val port = if (uri.port == -1) "" else ":${uri.port}"
-        return "https://$asciiHost$port"
+        return "https://$asciiHost$port${webRoot(uri.rawPath)}"
+    }
+
+    private fun webRoot(rawPath: String?): String {
+        if (rawPath.isNullOrBlank() || rawPath == "/") return ""
+        val segments = rawPath.split('/').filter { it.isNotEmpty() && it != "." }
+        if (segments.any { it == ".." }) {
+            throw ValidationException("The server address cannot contain ..")
+        }
+        val withoutFrontController = if (segments.lastOrNull() == "index.php") segments.dropLast(1) else segments
+        if (withoutFrontController.isEmpty()) return ""
+        return "/" + withoutFrontController.joinToString("/")
     }
 }

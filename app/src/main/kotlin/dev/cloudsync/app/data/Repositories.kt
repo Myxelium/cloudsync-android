@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.preferencesDataStore
 import dev.cloudsync.app.sync.SyncScheduler
 import dev.cloudsync.core.error.AuthenticationException
+import dev.cloudsync.core.error.CloudSyncException
 import dev.cloudsync.core.model.Account
 import dev.cloudsync.core.model.AccountStatus
 import dev.cloudsync.core.model.DeletionPolicy
@@ -27,6 +28,7 @@ import dev.cloudsync.core.url.ServerUrls
 import dev.cloudsync.database.CloudSyncDatabase
 import dev.cloudsync.database.toEntity
 import dev.cloudsync.database.toModel
+import dev.cloudsync.nextcloud.CloudUser
 import dev.cloudsync.nextcloud.LoginChallenge
 import dev.cloudsync.nextcloud.LoginFlowClient
 import dev.cloudsync.nextcloud.LoginPoll
@@ -97,8 +99,20 @@ class AccountRepository @Inject constructor(
 
     private suspend fun saveAccount(serverUrl: String, username: String, secret: String): Account = withContext(Dispatchers.IO) {
         val server = ServerUrls.normalize(serverUrl)
-        val stored = ocs.preferAppPassword(server, username, secret)
-        val user = ocs.currentUser(server, username, stored)
+        val stored = try {
+            ocs.preferAppPassword(server, username, secret)
+        } catch (error: AuthenticationException) {
+            throw error
+        } catch (_: CloudSyncException) {
+            secret
+        }
+        val user = try {
+            ocs.currentUser(server, username, stored)
+        } catch (error: AuthenticationException) {
+            throw error
+        } catch (_: CloudSyncException) {
+            CloudUser(username, username)
+        }
         val account = Account(
             id = ids.newId(),
             serverUrl = server,
