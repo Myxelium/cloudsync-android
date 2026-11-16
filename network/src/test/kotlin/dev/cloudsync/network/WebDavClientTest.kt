@@ -10,6 +10,8 @@ import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import okhttp3.OkHttpClient
 import org.junit.Test
+import javax.xml.XMLConstants
+import javax.xml.parsers.ParserConfigurationException
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
@@ -240,6 +242,26 @@ class WebDavClientTest {
         assertEquals(3963036L, video.size)
         assertEquals("video/mp4", video.contentType)
         assertEquals("/a+b.txt", nodes.first { it.etag == "plus" }.path)
+    }
+
+    @Test
+    fun androidRejectingSecureProcessingStillAppliesTheOtherLimits() {
+        val applied = mutableListOf<String>()
+        PropfindParser.enableXmlLimits { name, _ ->
+            if (name == XMLConstants.FEATURE_SECURE_PROCESSING) {
+                throw ParserConfigurationException(name)
+            }
+            applied += name
+        }
+        assertTrue(applied.contains("http://apache.org/xml/features/disallow-doctype-decl"))
+    }
+
+    @Test
+    fun aDocumentTypeDeclarationIsNotParsed() {
+        val xml = """<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY x "y">]><d:multistatus xmlns:d="DAV:"/>"""
+        assertFailsWith<org.xml.sax.SAXException> {
+            PropfindParser.parse(xml, "https://cloud.example/remote.php/dav/files/alice/")
+        }
     }
 
     @Test

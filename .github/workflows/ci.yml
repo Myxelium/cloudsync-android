@@ -76,9 +76,9 @@ jobs:
         with:
           api-level: 34
           arch: x86_64
-          disable-animations: true
+          disable-animations: false
           emulator-boot-timeout: 900
-          script: ./gradlew connectedDebugAndroidTest --stacktrace
+          script: bash .github/scripts/connected-android-tests.sh
       - name: Upload instrumented test results
         if: always()
         uses: actions/upload-artifact@v4
