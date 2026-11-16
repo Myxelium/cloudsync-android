@@ -76,9 +76,21 @@ jobs:
         with:
           api-level: 34
           arch: x86_64
-          disable-animations: true
+          disable-animations: false
           emulator-boot-timeout: 900
-          script: ./gradlew connectedDebugAndroidTest --stacktrace
+          script: |
+            set -euo pipefail
+            adb wait-for-device shell 'while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 2; done'
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              if adb shell settings put global window_animation_scale 0 \
+                && adb shell settings put global transition_animation_scale 0 \
+                && adb shell settings put global animator_duration_scale 0; then
+                break
+              fi
+              echo "Settings service was not ready (attempt ${attempt})."
+              sleep 3
+            done
+            ./gradlew connectedDebugAndroidTest --stacktrace
       - name: Upload instrumented test results
         if: always()
         uses: actions/upload-artifact@v4
