@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="credentials/" />
+        <exclude domain="database" path="cloudsync.db" />
+        <exclude domain="database" path="cloudsync.db-wal" />
+        <exclude domain="database" path="cloudsync.db-shm" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="credentials/" />
+        <exclude domain="database" path="cloudsync.db" />
+        <exclude domain="database" path="cloudsync.db-wal" />
+        <exclude domain="database" path="cloudsync.db-shm" />
+    </device-transfer>
+</data-extraction-rules>
