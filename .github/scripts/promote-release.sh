@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # release-please prepares a commit on release-please--branches--main and then
-# opens a pull request. This repository does not allow GitHub Actions to open
-# pull requests, so that call fails after the commit exists. Publish that
-# commit as the release instead.
+# opens a pull request. This token cannot open that pull request, so the call
+# fails after the commit exists. Publish that commit as the release instead.
 set -euo pipefail
 
 created=false
@@ -36,18 +35,22 @@ if [ "$status" -eq 0 ]; then
   exit 0
 fi
 
-if ! grep -q "not permitted to create or approve pull requests" "$log"; then
+# The pull request is refused either because Actions may not open pull requests,
+# or because this token has no pull-request permission. Both happen after the
+# release commit is already on release-please--branches--main.
+if ! git fetch origin release-please--branches--main; then
+  echo "release-please did not prepare a release branch."
   exit "$status"
 fi
-
-git fetch origin release-please--branches--main
 after=$(git rev-parse FETCH_HEAD)
 base="${GITHUB_SHA}"
 
 if [ "$after" = "$base" ] || ! git merge-base --is-ancestor "$base" "$after"; then
   echo "No release commit was prepared on top of ${base}."
-  exit 0
+  exit "$status"
 fi
+
+echo "The release pull request was not opened. Publishing the prepared commit."
 
 version=$(git show "${after}:.release-please-manifest.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["."])')
 packaged=$(git show "${after}:version.properties" | sed -n 's/^VERSION_NAME=//p' | tr -d '[:space:]')
