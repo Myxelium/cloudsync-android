@@ -78,4 +78,18 @@ jobs:
           arch: x86_64
           disable-animations: true
           emulator-boot-timeout: 900
-          script: ./gradlew connectedDebugAndroidTest --stacktrace
+          script: |
+            set +e
+            ./gradlew connectedDebugAndroidTest --stacktrace --continue
+            status=$?
+            find . -path '*/androidTest-results/connected/*.xml' -print -exec cat {} +
+            exit "$status"
+      - name: Upload instrumented test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connected-android-test-results
+          if-no-files-found: ignore
+          path: |
+            **/outputs/androidTest-results/connected/**
+            **/reports/androidTests/connected/**
